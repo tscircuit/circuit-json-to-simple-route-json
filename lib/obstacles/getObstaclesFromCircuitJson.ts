@@ -9,6 +9,45 @@ import type { Obstacle } from "./types"
 const EVERY_LAYER = ["top", "inner1", "inner2", "bottom"]
 const QUARTER_TURN_TOLERANCE_DEGREES = 0.01
 
+const expandKeepoutLayers = (layers: string[]): string[] => {
+  if (layers.some((layer) => layer === "all" || layer === "multilayer")) {
+    return EVERY_LAYER
+  }
+  return layers
+}
+
+const rotatePadLocalPoint = (
+  point: { x: number; y: number },
+  center: { x: number; y: number },
+  rotationDeg: number,
+): { x: number; y: number } => {
+  const angleRad = (rotationDeg * Math.PI) / 180
+  const cosAngle = Math.cos(angleRad)
+  const sinAngle = Math.sin(angleRad)
+  return {
+    x: center.x + point.x * cosAngle - point.y * sinAngle,
+    y: center.y + point.x * sinAngle + point.y * cosAngle,
+  }
+}
+
+type KeepoutOutlineElement = {
+  type: "pcb_keepout"
+  shape: "outline"
+  outline: { x: number; y: number }[]
+  stroke_width: number
+  layers: string[]
+  pcb_component_id?: string
+}
+
+const asKeepoutOutline = (
+  element: AnyCircuitElement,
+): KeepoutOutlineElement | null => {
+  if (element.type !== "pcb_keepout") return null
+  const maybe = element as unknown as KeepoutOutlineElement
+  if (maybe.shape !== "outline" || !Array.isArray(maybe.outline)) return null
+  return maybe
+}
+
 const getAxisAlignedRectFromRotatedRect = (
   rotatedRect: RotatedRect,
 ): {
@@ -141,11 +180,54 @@ export const getObstaclesFromCircuitJson = (
         })
       }
     } else if (element.type === "pcb_keepout") {
-      if (element.shape === "circle") {
+      const keepoutLayers = expandKeepoutLayers(element.layers)
+      const outlineKeepout = asKeepoutOutline(element)
+      if (outlineKeepout) {
+        if (outlineKeepout.outline.length >= 3) {
+          const approximatingRects = fillPolygonWithRects(
+            outlineKeepout.outline,
+            {
+              rectHeight: 0.6,
+            },
+          )
+
+          for (const rect of approximatingRects) {
+            obstacles.push({
+              componentId: pcbComponentId,
+              type: "rect",
+              layers: keepoutLayers,
+              center: rect.center,
+              width: rect.width,
+              height: rect.height,
+              connectedTo: [],
+            })
+          }
+        } else if (outlineKeepout.outline.length === 2) {
+          const [start, end] = outlineKeepout.outline
+          if (!start || !end) continue
+          const dx = end.x - start.x
+          const dy = end.y - start.y
+          const length = Math.hypot(dx, dy)
+          if (length <= 1e-9) continue
+          obstacles.push({
+            componentId: pcbComponentId,
+            type: "rect",
+            layers: keepoutLayers,
+            center: {
+              x: (start.x + end.x) / 2,
+              y: (start.y + end.y) / 2,
+            },
+            width: length,
+            height: outlineKeepout.stroke_width,
+            ccwRotationDegrees: (Math.atan2(dy, dx) * 180) / Math.PI,
+            connectedTo: [],
+          })
+        }
+      } else if (element.shape === "circle") {
         obstacles.push({
           componentId: pcbComponentId,
           type: "oval",
-          layers: element.layers,
+          layers: keepoutLayers,
           center: {
             x: element.center.x,
             y: element.center.y,
@@ -158,7 +240,7 @@ export const getObstaclesFromCircuitJson = (
         obstacles.push({
           componentId: pcbComponentId,
           type: "rect",
-          layers: element.layers,
+          layers: keepoutLayers,
           center: {
             x: element.center.x,
             y: element.center.y,
@@ -350,14 +432,23 @@ export const getObstaclesFromCircuitJson = (
           connectedTo: withNetId([element.pcb_plated_hole_id]),
         })
       } else if (element.shape === "hole_with_polygon_pad") {
-        // Calculate bounding box from pad outline
+        // pad_outline is pad-local; rotate about the hole center like copper-pour-solver
         if (
           "pad_outline" in element &&
           element.pad_outline &&
           element.pad_outline.length > 0
         ) {
-          const xs = element.pad_outline.map((p) => element.x + p.x)
-          const ys = element.pad_outline.map((p) => element.y + p.y)
+          const rotationDeg =
+            "ccw_rotation" in element ? (element.ccw_rotation ?? 0) : 0
+          const worldPoints = element.pad_outline.map((point) =>
+            rotatePadLocalPoint(
+              point,
+              { x: element.x, y: element.y },
+              rotationDeg,
+            ),
+          )
+          const xs = worldPoints.map((p) => p.x)
+          const ys = worldPoints.map((p) => p.y)
           const minX = Math.min(...xs)
           const maxX = Math.max(...xs)
           const minY = Math.min(...ys)
